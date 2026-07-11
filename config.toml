@@ -1,0 +1,46 @@
+# How often (in seconds) a new batch of transactions is created and broadcast.
+interval_secs = 1
+
+# Transaction generation mode:
+#   "unit"  — one tx per interval tick
+#   "batch" — multiple txs per interval tick (requires batch_size)
+mode = "unit"
+# mode = "batch"
+
+# Number of transactions to create per interval tick.
+# Only meaningful when mode = "batch" — ignored for "unit".
+batch_size = 100
+
+# BIP39 mnemonic seed phrase.
+# Both sender and receiver addresses are derived from this single master key.
+seed_phrase = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
+
+# BIP84 (native segwit P2WPKH) account index for the sending wallet.
+# Derives the sender address at m/84'/{coin_type}'/{sender_account_index}'/0/0.
+sender_account_index = 0
+
+# BIP84 (native segwit P2WPKH) account index for the receiving address.
+# Derives the receiver address at m/84'/{coin_type}'/{receiver_account_index}'/0/0.
+receiver_account_index = 1
+
+# (Optional) BIP84 account index for the fixed change address.
+# All change outputs go to m/84'/{coin_type}'/{change_account_index}'/0/0.
+# When omitted, defaults to sender_account_index (change returns to sender's
+# own address). Set to the same value as sender_account_index to explicitly
+# send change back to the sender, or use a different account for separation.
+# change_account_index = 0
+
+# Amount to send per transaction, in satoshis.
+amount_sat = 1000
+
+# Fee rate per transaction, in satoshis per virtual byte.
+fee_rate_sat_per_vb = 5
+
+# Bitcoin network. Determines {coin_type} in derivation paths (mainnet=0', others=1').
+network = "signet"
+
+# Bitcoin Core RPC connection settings.
+rpc_address = "0.0.0.0"
+rpc_port = 38332
+rpc_username = "username"
+rpc_password = "password"

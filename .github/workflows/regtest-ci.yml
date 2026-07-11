@@ -1,0 +1,175 @@
+name: Regtest CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  regtest:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        mode: [unit, batch]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Download Bitcoin Core
+        run: |
+          BTC_VERSION="31.0"
+          BTC_TAR="bitcoin-${BTC_VERSION}-x86_64-linux-gnu.tar.gz"
+          BTC_SHA256="d3e4c58a35b1d0a97a457462c94f55501ad167c660c245cb1ffa565641c65074"
+          curl -sSLO "https://bitcoincore.org/bin/bitcoin-core-${BTC_VERSION}/${BTC_TAR}"
+          echo "${BTC_SHA256}  ${BTC_TAR}" | sha256sum -c
+          tar xzf "${BTC_TAR}"
+          echo "$PWD/bitcoin-${BTC_VERSION}/bin" >> "$GITHUB_PATH"
+
+      - name: Start bitcoind
+        run: |
+          BITCOIN_DATA="$RUNNER_TEMP/bitcoin-data"
+          echo "BITCOIN_DATA=$BITCOIN_DATA" >> "$GITHUB_ENV"
+          mkdir -p "$BITCOIN_DATA"
+
+          cat > "$BITCOIN_DATA/bitcoin.conf" << 'EOF'
+          regtest=1
+          rpcuser=ci-user
+          rpcpassword=ci-password
+          server=1
+          fallbackfee=0.00001
+          EOF
+
+          bitcoind -datadir="$BITCOIN_DATA" -daemon
+
+          for i in $(seq 1 30); do
+            if bitcoin-cli -datadir="$BITCOIN_DATA" getblockchaininfo 2>/dev/null; then
+              echo "Bitcoin Core RPC ready"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "Bitcoin Core RPC did not become ready"
+          exit 1
+
+      - name: Generate config
+        run: |
+          cat > config.toml << 'EOF'
+          interval_secs = 5
+          mode = "${{ matrix.mode }}"
+          batch_size = 5
+          seed_phrase = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
+          sender_account_index = 0
+          receiver_account_index = 1
+          amount_sat = 1000
+          fee_rate_sat_per_vb = 5
+          network = "regtest"
+          rpc_address = "127.0.0.1"
+          rpc_port = 18443
+          rpc_username = "ci-user"
+          rpc_password = "ci-password"
+          EOF
+          echo "=== config.toml ==="
+          cat config.toml
+
+      - name: Probe sender address
+        run: |
+          RUST_LOG=info ./target/release/sv2-tx-generator config.toml > probe.log 2>&1 &
+          PROBE_PID=$!
+
+          for i in $(seq 1 20); do
+            if grep -q "Sender (display" probe.log 2>/dev/null; then
+              echo "Probe started"
+              break
+            fi
+            sleep 1
+          done
+
+          kill $PROBE_PID 2>/dev/null || true
+          wait $PROBE_PID 2>/dev/null || true
+
+          SENDER=$(grep "Sender (display" probe.log | head -1 | sed 's/.*Sender (display \/0\/0): //')
+          RECEIVER=$(grep "Receiver (destination)" probe.log | head -1 | sed 's/.*Receiver (destination):  //')
+          echo "Sender:   $SENDER"
+          echo "Receiver: $RECEIVER"
+
+          if [ -z "$SENDER" ] || [ -z "$RECEIVER" ]; then
+            echo "ERROR: Could not parse addresses from probe output"
+            echo "=== probe.log ==="
+            cat probe.log
+            exit 1
+          fi
+
+          echo "SENDER=$SENDER" >> "$GITHUB_ENV"
+          echo "RECEIVER=$RECEIVER" >> "$GITHUB_ENV"
+
+      - name: Mine blocks
+        run: |
+          BITCOIN_CLI="bitcoin-cli -datadir=$BITCOIN_DATA"
+          $BITCOIN_CLI generatetoaddress 101 "$SENDER"
+          echo "Mined 101 blocks to $SENDER"
+
+      - name: Run generator
+        run: |
+          RUST_LOG=info ./target/release/sv2-tx-generator config.toml > generator.log 2>&1 &
+          GENERATOR_PID=$!
+
+          sleep 20
+
+          kill $GENERATOR_PID 2>/dev/null || true
+          wait $GENERATOR_PID 2>/dev/null || true
+
+          echo "=== generator.log ==="
+          cat generator.log
+
+      - name: Assert correctness
+        run: |
+          BITCOIN_CLI="bitcoin-cli -datadir=$BITCOIN_DATA"
+
+          MEMPOOL=$($BITCOIN_CLI getrawmempool)
+          TX_COUNT=$(echo "$MEMPOOL" | jq '. | length')
+          echo "Mempool has $TX_COUNT transaction(s)"
+
+          if [ "$TX_COUNT" -lt 1 ]; then
+            echo "FAIL: Expected at least 1 tx in mempool, got $TX_COUNT"
+            echo "=== generator.log ==="
+            cat generator.log
+            exit 1
+          fi
+
+          FAILED=0
+          for txid in $(echo "$MEMPOOL" | jq -r '.[]'); do
+            TX=$($BITCOIN_CLI getrawtransaction "$txid" 1)
+            MATCHES=$(echo "$TX" | jq --arg addr "$RECEIVER" '[.vout[] | select(.scriptPubKey.address == $addr)]')
+            if [ "$(echo "$MATCHES" | jq 'length')" -eq 0 ]; then
+              echo "FAIL: tx $txid has no output to receiver $RECEIVER"
+              FAILED=1
+            else
+              echo "PASS: tx $txid has output to receiver"
+            fi
+          done
+
+          if [ "$FAILED" -eq 1 ]; then
+            exit 1
+          fi
+
+          echo "SUCCESS: All mempool txs have correct receiver outputs"
+
+      - name: Show diagnostics on failure
+        if: failure()
+        run: |
+          echo "=== generator.log ==="
+          cat generator.log 2>/dev/null || true
+          echo "=== bitcoind debug.log ==="
+          cat "$BITCOIN_DATA/regtest/debug.log" 2>/dev/null || true
+          echo "=== mempool detail ==="
+          bitcoin-cli -datadir="$BITCOIN_DATA" getrawmempool 1 2>/dev/null || true
+
+      - name: Cleanup
+        if: always()
+        run: bitcoin-cli -datadir="$BITCOIN_DATA" stop 2>/dev/null || true
